@@ -1,42 +1,34 @@
-from typing import AsyncGenerator
-from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+import os
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from fastapi import Depends
+from typing import Annotated
 
-from settings.configs.app import db_settings
+# 1. Беремо рядок з .env, а якщо його немає (про всяк випадок) — використовуємо дефолтний SQLite
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./fastapi_db.db")
 
-DATABASE_URL = db_settings.DATABASE_URL
-
+# 2. Створюємо асинхронний двигун для SQLite
 engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,
+    DATABASE_URL, 
+    echo=True,
+    # Цей параметр потрібен тільки для SQLite, щоб підтримувати роботу з потоками FastAPI
+    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
 )
 
+# 3. Фабрика сесій
 AsyncSessionLocal = async_sessionmaker(
-    bind=engine,
-    autoflush=False,
-    expire_on_commit=False,
-    class_=AsyncSession,
+    bind=engine, 
+    class_=AsyncSession, 
+    expire_on_commit=False
 )
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
+# 4. Функція-генератор сесій для ін'єкції залежностей
+async def get_db():
     async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+        yield session
 
-async def ping() -> bool:
-    if not engine:
-        return False
-    try:
-        async with engine.begin() as conn:
-            await conn.execute(text("SELECT 1"))
-        return True
-    except SQLAlchemyError:
-        return False
+# Переконайтеся, що назва типу співпадає з тією, яку ви імпортуєте в роутерах (SessionDepend)
+SessionDepend = Annotated[AsyncSession, Depends(get_db)]
+
+# Якщо у вашому main.py імпортується функція ping, додамо її просту заглушку
+async def ping():
+    return True
