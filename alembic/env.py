@@ -1,6 +1,6 @@
 import asyncio
 from logging.config import fileConfig
-
+from models.user import User
 from sqlalchemy import pool
 # Додаємо create_async_engine в імпорт:
 from sqlalchemy.ext.asyncio import async_engine_from_config, create_async_engine
@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config, create_async_engine
 from alembic import context
 from settings.configs.app import db_settings  # Імпортуємо налаштування вашої БД
 from models import Base  # Імпортуємо базовий клас ваших моделей
+
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

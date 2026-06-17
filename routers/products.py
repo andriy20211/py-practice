@@ -1,29 +1,61 @@
 import logging
-from typing import Annotated
+from typing import Sequence
 
-from fastapi import APIRouter, Depends, HTTPException, status, Response
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
+from authx import RequestToken
 
-from settings.db import get_db
-from models import Product  # Перевірте, як саме імпортується ваша модель Product
 from schemas.product import ProductCreate, ProductRead, ProductUpdate
+from services.products import ProductService, get_product_service
+from services.pdf_generator import generate_products_report
+from utils.security import security
 
-# Налаштування логування для цього роутера
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/products", tags=["Products"])
 
-# Сучасне оголошення залежності сесії БД через Annotated
-SessionDepend = Annotated[AsyncSession, Depends(get_db)]
 
-
-# 1. Отримання списку всього одягу (READ - GET)
-@router.get("/", response_model=list[ProductRead])
-async def get_products(session: SessionDepend):
+@router.get(
+    path="/report",
+    summary="Generate and download PDF report of products",
+    tags=["Products"]
+)
+async def get_products_report(product_service: ProductService = Depends(get_product_service)):
     try:
-        result = await session.execute(select(Product))
-        return result.scalars().all()
+        products = await product_service.get_all()
+        if not products:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No products found to generate report"
+            )
+
+        # Генеруємо PDF файл за допомогою сервісу
+        filepath = generate_products_report("products_report.pdf", products)
+
+        # Повертаємо його користувачу як файл для завантаження
+        return FileResponse(
+            path=filepath,
+            filename="products_report.pdf",
+            media_type="application/pdf"
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to generate report")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate report",
+        ) from exc
+
+
+@router.get(
+    path="/",
+    response_model=list[ProductRead],
+    tags=["Products"],
+)
+async def get_products(product_service: ProductService = Depends(get_product_service)):
+    try:
+        return await product_service.get_all()
     except HTTPException:
         raise
     except Exception as exc:
@@ -34,19 +66,25 @@ async def get_products(session: SessionDepend):
         ) from exc
 
 
-# 2. Отримання однієї одиниці одягу за ID (READ - GET)
-@router.get("/{product_id}", response_model=ProductRead)
-async def get_product(product_id: int, session: SessionDepend):
+@router.get(
+    path="/{product_id}",
+    response_model=ProductRead,
+    tags=["Products"],
+)
+async def get_product(
+        product_id: int,
+        product_service: ProductService = Depends(get_product_service)
+):
     try:
-        result = await session.execute(select(Product).where(Product.id == product_id))
-        product = result.scalars().first()
-        
+        product = await product_service.get_by_id(product_id=product_id)
+
         if not product:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail="Product not found"
+                status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
             )
+
         return product
+
     except HTTPException:
         raise
     except Exception as exc:
@@ -57,19 +95,22 @@ async def get_product(product_id: int, session: SessionDepend):
         ) from exc
 
 
-# 3. Додавання нового одягу в магазин (CREATE - POST)
-@router.post("/", response_model=ProductRead, status_code=status.HTTP_201_CREATED)
-async def create_product(product_data: ProductCreate, session: SessionDepend):
+@router.post(
+    path="/",
+    response_model=ProductRead,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Products"],
+)
+async def create_product(
+        product_data: ProductCreate,
+        product_service: ProductService = Depends(get_product_service),
+        token: RequestToken = Depends(security.access_token_required)  # Захищено токеном
+):
     try:
-        new_product = Product(**product_data.model_dump())
-        session.add(new_product)
-        await session.commit()
-        await session.refresh(new_product)
-        return new_product
+        return await product_service.create(data=product_data)
     except HTTPException:
         raise
     except Exception as exc:
-        await session.rollback()
         logger.exception("Failed to create product")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -77,31 +118,29 @@ async def create_product(product_data: ProductCreate, session: SessionDepend):
         ) from exc
 
 
-# 4. Часткове оновлення інформації про товар (UPDATE - PATCH)
-@router.patch("/{product_id}", response_model=ProductRead)
-async def update_product(product_id: int, product_update: ProductUpdate, session: SessionDepend):
+@router.put(
+    path="/{product_id}",
+    response_model=ProductRead,
+    tags=["Products"],
+)
+async def update_product(
+        product_id: int,
+        product_update: ProductUpdate,
+        product_service: ProductService = Depends(get_product_service),
+):
     try:
-        result = await session.execute(select(Product).where(Product.id == product_id))
-        existing_product = result.scalars().first()
-        
-        if not existing_product:
+        product = await product_service.update(product_id=product_id, data=product_update)
+
+        if not product:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail="Product not found"
+                status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
             )
-            
-        # Оновлюємо лише ті поля, які користувач передав у запиті
-        for field, value in product_update.model_dump(exclude_unset=True).items():
-            setattr(existing_product, field, value)
-            
-        session.add(existing_product)
-        await session.commit()
-        await session.refresh(existing_product)
-        return existing_product
+
+        return product
+
     except HTTPException:
         raise
     except Exception as exc:
-        await session.rollback()
         logger.exception("Failed to update product with id %s", product_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -109,26 +148,37 @@ async def update_product(product_id: int, product_update: ProductUpdate, session
         ) from exc
 
 
-# 5. Видалення товару з магазину (DELETE)
-@router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_product(product_id: int, session: SessionDepend):
+@router.delete(
+    path="/{product_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["Products"],
+)
+async def delete_product(
+        product_id: int,
+        product_service: ProductService = Depends(get_product_service),
+        token: RequestToken = Depends(security.access_token_required)  # Захищено токеном
+):
+    # Рольова модель (RBAC): Перевірка, чи користувач є адміністратором
+    user_role = token.custom_claims.get("role")
+    if user_role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Only administrators can delete products"
+        )
+
     try:
-        result = await session.execute(select(Product).where(Product.id == product_id))
-        existing_product = result.scalars().first()
-        
-        if not existing_product:
+        deleted = await product_service.delete(product_id=product_id)
+
+        if not deleted:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail="Product not found"
+                status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
             )
-            
-        await session.delete(existing_product)
-        await session.commit()
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        return None
+
     except HTTPException:
         raise
     except Exception as exc:
-        await session.rollback()
         logger.exception("Failed to delete product with id %s", product_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
